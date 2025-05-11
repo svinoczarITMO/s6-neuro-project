@@ -1,2 +1,6 @@
 venv
 .DS_Store
+podcast
+dataset
+.ipynb_checkpoints
+__pycache__
