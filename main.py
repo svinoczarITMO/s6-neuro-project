@@ -13,18 +13,24 @@ from voice_recognition import AudioTransform, EmotionRecognitionModel
 from collections import Counter
 from moviepy.editor import VideoFileClip
 from face_recognition import process_video
+# import logging
 from loguru import logger
 import threading
 import cv2
 import time
 import tempfile
 import shutil
+from speech_to_text import analyze_audio
+
+# Настройка логирования
+# logging.basicConfig(level=logging.INFO)
+# logger = logging.getLogger(__name__)
 
 class EmotionAnalyzerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Анализатор эмоций")
-        self.root.geometry("1000x800")  # Увеличиваем разрешение окна
+        self.root.geometry("1000x800")
 
         # Загрузка модели и encoder
         try:
@@ -34,7 +40,8 @@ class EmotionAnalyzerApp:
             self.audio_model.load_state_dict(torch.load('models/emotion_recognition_model.pth'))
             self.audio_model.eval()
             self.audio_transform = AudioTransform(target_length=16000)
-            print("Модели успешно загружены")
+
+            logger.info("Модели успешно загружены")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось загрузить модели: {str(e)}")
             root.destroy()
@@ -83,6 +90,11 @@ class EmotionAnalyzerApp:
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
 
+        # Передискретизация на 16000 Гц
+        if sample_rate != 16000:
+            resampler = T.Resample(sample_rate, 16000)
+            waveform = resampler(waveform)
+
         mel_spec = self.audio_transform(waveform)
         mel_spec = mel_spec.unsqueeze(0)
 
@@ -92,11 +104,13 @@ class EmotionAnalyzerApp:
             predicted_class = torch.argmax(probabilities).item()
             emotion = self.label_encoder.inverse_transform([predicted_class])[0]
 
+        logger.info(f"Аудио сегмент: эмоция - {emotion}")
+
         return emotion
 
-    def analyze_audio(self, audio_path, segment_duration):
+    def analyze_audio_emotions(self, audio_path, segment_duration):
         try:
-            logger.info('analyze audio...')
+            logger.info('Анализ аудио...')
             waveform, sample_rate = torchaudio.load(audio_path)
             total_samples = len(waveform[0])
             segment_samples = int(segment_duration * sample_rate)
@@ -104,8 +118,9 @@ class EmotionAnalyzerApp:
 
             segment_emotions = []
             temp_dir = tempfile.mkdtemp()
+
             for i in range(num_segments):
-                logger.info(f'analyze audio segment {i}...')
+                logger.info(f'Анализ аудио сегмента {i}...')
                 segment = waveform[:, i * segment_samples:(i + 1) * segment_samples]
                 segment_path = os.path.join(temp_dir, f"segment_{i}.wav")
                 torchaudio.save(segment_path, segment, sample_rate)
@@ -138,7 +153,8 @@ class EmotionAnalyzerApp:
                     video.release()
 
                     segment_duration = 2.0  # Длительность сегмента в секундах
-                    audio_emotions = self.analyze_audio(audio_path, segment_duration)
+                    audio_emotions = self.analyze_audio_emotions(audio_path, segment_duration)
+                    transcriptions = analyze_audio(audio_path)
 
                     self.progress_bar["value"] = 0
                     self.progress_bar["maximum"] = 100
@@ -150,34 +166,39 @@ class EmotionAnalyzerApp:
                         self.root.update_idletasks()
 
                     video_results = process_video(file_path, frames_per_second=10, batch_size=10, progress_callback=update_progress)
+                    logger.info(f'VIDEO RESULTS: {video_results}')
 
-                    self.results_text.delete(1.0, tk.END)
-                    self.results_text.insert(tk.END, f"Файл: {os.path.basename(file_path)}\n")
-
-                    for i, (audio_emotion, video_result) in enumerate(zip(audio_emotions, video_results)):
-                        start_time = i * segment_duration
-                        end_time = (i + 1) * segment_duration
-                        self.results_text.insert(tk.END, f"[{time.strftime('%M:%S', time.gmtime(start_time))} - {time.strftime('%M:%S', time.gmtime(end_time))}]: аудио - {audio_emotion}, видео - {video_result['dominant_emotion']}\n")
-
-                    self.root.after(0, self.create_plot, audio_emotions, video_results)
+                    self.root.after(0, lambda: self.update_results(file_path, audio_emotions, transcriptions, video_results))
 
                 elif file_path.endswith('.wav'):
-                    audio_emotions = self.analyze_audio(file_path, segment_duration=2.0)
+                    audio_emotions = self.analyze_audio_emotions(file_path, segment_duration=2.0)
+                    transcriptions = analyze_audio(file_path)
 
-                    self.results_text.delete(1.0, tk.END)
-                    self.results_text.insert(tk.END, f"Файл: {os.path.basename(file_path)}\n")
-
-                    for i, emotion in enumerate(audio_emotions):
-                        start_time = i * 2
-                        end_time = (i + 1) * 2
-                        self.results_text.insert(tk.END, f"[{time.strftime('%M:%S', time.gmtime(start_time))} - {time.strftime('%M:%S', time.gmtime(end_time))}]: аудио - {emotion}\n")
-
-                    self.root.after(0, self.create_plot, audio_emotions)
+                    self.root.after(0, lambda: self.update_results(file_path, audio_emotions, transcriptions))
 
             except Exception as e:
                 messagebox.showerror("Ошибка", f"Произошла ошибка при анализе: {str(e)}")
 
         threading.Thread(target=analyze).start()
+
+    def update_results(self, file_path, audio_emotions, transcriptions, video_results=None):
+        self.results_text.delete(1.0, tk.END)
+        self.results_text.insert(tk.END, f"Файл: {os.path.basename(file_path)}\n")
+
+        if video_results:
+            for i, (audio_emotion, (start, end, transcription), video_result) in enumerate(zip(audio_emotions, transcriptions, video_results)):
+                self.results_text.insert(tk.END, f"[{time.strftime('%M:%S', time.gmtime(start))}.{int((start % 1) * 1000):03d} - {time.strftime('%M:%S', time.gmtime(end))}.{int((end % 1) * 1000):03d}]: аудио - {audio_emotion}, видео - {video_result.get('dominant_emotion', 'N/A')}, текст - {transcription}\n")
+
+                logger.info(f"[{time.strftime('%M:%S', time.gmtime(start))}.{int((start % 1) * 1000):03d} - {time.strftime('%M:%S', time.gmtime(end))}.{int((end % 1) * 1000):03d}]: аудио - {audio_emotion}, видео - {video_result.get('dominant_emotion', 'N/A')}, текст - {transcription}")
+
+            self.create_plot(audio_emotions, video_results)
+        else:
+            for i, (emotion, (start, end, transcription)) in enumerate(zip(audio_emotions, transcriptions)):
+                self.results_text.insert(tk.END, f"[{time.strftime('%M:%S', time.gmtime(start))}.{int((start % 1) * 1000):03d} - {time.strftime('%M:%S', time.gmtime(end))}.{int((end % 1) * 1000):03d}]: аудио - {emotion}, текст - {transcription}\n")
+
+                logger.info(f"[{time.strftime('%M:%S', time.gmtime(start))}.{int((start % 1) * 1000):03d} - {time.strftime('%M:%S', time.gmtime(end))}.{int((end % 1) * 1000):03d}]: аудио - {emotion}, текст - {transcription}")
+
+            self.create_plot(audio_emotions)
 
     def create_plot(self, audio_emotions, video_results=None):
         for widget in self.plot_frame.winfo_children():
@@ -193,7 +214,7 @@ class EmotionAnalyzerApp:
 
         # График для видео
         if video_results:
-            video_emotions = [result['dominant_emotion'] for result in video_results]
+            video_emotions = [result.get('dominant_emotion', 'N/A') for result in video_results]
             axs[1].bar(range(len(video_emotions)), video_emotions)
             axs[1].set_title("Распределение эмоций по сегментам (видео)")
             axs[1].set_xticks(range(len(video_emotions)))

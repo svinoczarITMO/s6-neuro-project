@@ -9,6 +9,7 @@ def analyze_emotions(test_image):
 
     emo_detector = FER(mtcnn=True)
     captured_emotions = emo_detector.detect_emotions(test_image)
+    logger.debug(captured_emotions)
 
     if captured_emotions:
         return captured_emotions[0]['emotions']
@@ -22,6 +23,7 @@ def process_batch(batch_frames, batch_times):
         results = list(executor.map(analyze_emotions, batch_frames))
 
     for frame, emotions, time in zip(batch_frames, results, batch_times):
+        # logger.debug(emotions)
         if emotions:
             for emotion, value in emotions.items():
                 batch_emotions[emotion] = batch_emotions.get(emotion, 0) + value
@@ -64,6 +66,7 @@ def process_video(video_path, frames_per_second=5, batch_size=10, progress_callb
 
         if len(batch_frames) == batch_size:
             result = process_batch(batch_frames, batch_times)
+            logger.info(result)
             if result:
                 results.append(result)
             batch_frames = []
