@@ -1,6 +1,10 @@
-venv
+.venv
 .DS_Store
 podcast
 dataset
 .ipynb_checkpoints
 __pycache__
+*.mov
+*.mp4
+*.wav
+*.jpg

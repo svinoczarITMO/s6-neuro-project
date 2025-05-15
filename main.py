@@ -12,40 +12,37 @@ import joblib
 from voice_recognition import AudioTransform, EmotionRecognitionModel
 from collections import Counter
 from moviepy.editor import VideoFileClip
-from face_recognition import FaceEmotionAnalyzer
+from face_recognition import process_video
+from loguru import logger
+import threading
+import cv2
+import time
+import tempfile
+import shutil
 
 class EmotionAnalyzerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Анализатор эмоций")
-        self.root.geometry("800x600")
+        self.root.geometry("1000x800")  # Увеличиваем разрешение окна
 
         # Загрузка модели и encoder
         try:
-            # Инициализация модели для аудио
             self.label_encoder = joblib.load('models/label_encoder.joblib')
             num_classes = len(self.label_encoder.classes_)
             self.audio_model = EmotionRecognitionModel(num_classes)
             self.audio_model.load_state_dict(torch.load('models/emotion_recognition_model.pth'))
             self.audio_model.eval()
-
-            # Инициализация преобразования аудио
             self.audio_transform = AudioTransform(target_length=16000)
-
-            # Инициализация модели для видео
-            self.face_emotion_analyzer = FaceEmotionAnalyzer('models/FER_static_ResNet50_AffectNet.pt')
-
             print("Модели успешно загружены")
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось загрузить модели: {str(e)}")
             root.destroy()
             return
 
-        # Создание интерфейса
         self.create_widgets()
 
     def create_widgets(self):
-        # Фрейм для загрузки файла
         upload_frame = ttk.LabelFrame(self.root, text="Загрузка файла", padding="10")
         upload_frame.pack(fill="x", padx=10, pady=5)
 
@@ -54,17 +51,20 @@ class EmotionAnalyzerApp:
         ttk.Button(upload_frame, text="Выбрать файл", command=self.load_file).pack(side="left", padx=5)
         ttk.Button(upload_frame, text="Анализировать", command=self.analyze_file).pack(side="left", padx=5)
 
-        # Фрейм для результатов
         results_frame = ttk.LabelFrame(self.root, text="Результаты анализа", padding="10")
         results_frame.pack(fill="both", expand=True, padx=10, pady=5)
 
-        # Текстовое поле для результатов
         self.results_text = tk.Text(results_frame, height=10, width=60)
         self.results_text.pack(fill="both", expand=True)
 
-        # Фрейм для графика
         self.plot_frame = ttk.LabelFrame(self.root, text="Визуализация", padding="10")
         self.plot_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        self.progress_frame = ttk.LabelFrame(self.root, text="Прогресс", padding="10")
+        self.progress_frame.pack(fill="x", padx=10, pady=5)
+
+        self.progress_bar = ttk.Progressbar(self.progress_frame, orient="horizontal", length=200, mode="determinate")
+        self.progress_bar.pack(fill="x", padx=5, pady=5)
 
     def load_file(self):
         file_path = filedialog.askopenfilename(
@@ -78,58 +78,45 @@ class EmotionAnalyzerApp:
         video.audio.write_audiofile(audio_path)
         video.close()
 
-    def analyze_audio(self, audio_path):
+    def analyze_audio_segment(self, audio_path, segment_duration):
+        waveform, sample_rate = torchaudio.load(audio_path)
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        mel_spec = self.audio_transform(waveform)
+        mel_spec = mel_spec.unsqueeze(0)
+
+        with torch.no_grad():
+            output = self.audio_model(mel_spec)
+            probabilities = torch.softmax(output, dim=1)[0]
+            predicted_class = torch.argmax(probabilities).item()
+            emotion = self.label_encoder.inverse_transform([predicted_class])[0]
+
+        return emotion
+
+    def analyze_audio(self, audio_path, segment_duration):
         try:
-            # Загрузка и обработка аудио
+            logger.info('analyze audio...')
             waveform, sample_rate = torchaudio.load(audio_path)
+            total_samples = len(waveform[0])
+            segment_samples = int(segment_duration * sample_rate)
+            num_segments = total_samples // segment_samples
 
-            # Конвертация в моно если стерео
-            if waveform.shape[0] > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            segment_emotions = []
+            temp_dir = tempfile.mkdtemp()
+            for i in range(num_segments):
+                logger.info(f'analyze audio segment {i}...')
+                segment = waveform[:, i * segment_samples:(i + 1) * segment_samples]
+                segment_path = os.path.join(temp_dir, f"segment_{i}.wav")
+                torchaudio.save(segment_path, segment, sample_rate)
+                emotion = self.analyze_audio_segment(segment_path, segment_duration)
+                segment_emotions.append(emotion)
 
-            # Список для хранения предсказаний
-            predictions = []
-            probabilities_list = []
-
-            # Делаем 10 предсказаний
-            for _ in range(10):
-                # Применение преобразований
-                mel_spec = self.audio_transform(waveform)
-
-                # Добавление размерности батча
-                mel_spec = mel_spec.unsqueeze(0)
-
-                # Получение предсказания
-                with torch.no_grad():
-                    output = self.audio_model(mel_spec)
-                    probabilities = torch.softmax(output, dim=1)[0]
-                    predicted_class = torch.argmax(probabilities).item()
-                    predictions.append(predicted_class)
-                    probabilities_list.append(probabilities)
-
-            # Находим наиболее часто встречающийся класс
-            most_common_class = Counter(predictions).most_common(1)[0][0]
-
-            # Вычисляем средние вероятности
-            avg_probabilities = torch.stack(probabilities_list).mean(dim=0)
-            confidence = avg_probabilities[most_common_class].item()
-
-            # Получение названия эмоции
-            emotion = self.label_encoder.inverse_transform([most_common_class])[0]
-
-            return emotion, confidence, avg_probabilities
+            shutil.rmtree(temp_dir)
+            return segment_emotions
 
         except Exception as e:
             messagebox.showerror("Ошибка", f"Произошла ошибка при анализе аудио: {str(e)}")
-            return None, None, None
-
-    def analyze_video(self, video_path):
-        try:
-            # Анализ видео
-            emotion = self.face_emotion_analyzer.analyze_emotion(video_path)
-            return emotion
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Произошла ошибка при анализе видео: {str(e)}")
             return None
 
     def analyze_file(self):
@@ -138,74 +125,87 @@ class EmotionAnalyzerApp:
             messagebox.showwarning("Предупреждение", "Выберите файл для анализа")
             return
 
-        try:
-            if file_path.endswith(('.mp4', '.mov')):
-                audio_path = "temp_audio.wav"
-                self.extract_audio_from_video(file_path, audio_path)
+        def analyze():
+            try:
+                if file_path.endswith(('.mp4', '.mov', '.MOV')):
+                    audio_path = "temp_audio.wav"
+                    self.extract_audio_from_video(file_path, audio_path)
 
-                # Анализ аудио
-                audio_emotion, confidence, avg_probabilities = self.analyze_audio(audio_path)
+                    video = cv2.VideoCapture(file_path)
+                    fps = video.get(cv2.CAP_PROP_FPS)
+                    frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+                    duration = frame_count / fps
+                    video.release()
 
-                # Анализ видео
-                video_emotion = self.analyze_video(file_path)
+                    segment_duration = 2.0  # Длительность сегмента в секундах
+                    audio_emotions = self.analyze_audio(audio_path, segment_duration)
 
-                # Отображение результатов
-                self.results_text.delete(1.0, tk.END)
-                self.results_text.insert(tk.END, f"Файл: {os.path.basename(file_path)}\n")
-                self.results_text.insert(tk.END, f"Определенная эмоция по аудио: {audio_emotion}\n")
-                self.results_text.insert(tk.END, f"Уверенность: {confidence:.2%}\n")
-                self.results_text.insert(tk.END, f"Определенная эмоция по видео: {video_emotion}\n")
+                    self.progress_bar["value"] = 0
+                    self.progress_bar["maximum"] = 100
+                    self.root.update_idletasks()
 
-                # Отображение распределения предсказаний
-                self.results_text.insert(tk.END, "\nСредние вероятности:\n")
-                for i, prob in enumerate(avg_probabilities):
-                    emotion_name = self.label_encoder.inverse_transform([i])[0]
-                    self.results_text.insert(tk.END, f"{emotion_name}: {prob:.2%}\n")
+                    def update_progress(current, total):
+                        progress = (current / total) * 100
+                        self.progress_bar["value"] = progress
+                        self.root.update_idletasks()
 
-                # Создание графика
-                self.create_plot(avg_probabilities.numpy(), self.label_encoder.classes_)
+                    video_results = process_video(file_path, frames_per_second=10, batch_size=10, progress_callback=update_progress)
 
-            elif file_path.endswith('.wav'):
-                # Анализ аудио
-                audio_emotion, confidence, avg_probabilities = self.analyze_audio(file_path)
+                    self.results_text.delete(1.0, tk.END)
+                    self.results_text.insert(tk.END, f"Файл: {os.path.basename(file_path)}\n")
 
-                # Отображение результатов
-                self.results_text.delete(1.0, tk.END)
-                self.results_text.insert(tk.END, f"Файл: {os.path.basename(file_path)}\n")
-                self.results_text.insert(tk.END, f"Определенная эмоция: {audio_emotion}\n")
-                self.results_text.insert(tk.END, f"Уверенность: {confidence:.2%}\n\n")
+                    for i, (audio_emotion, video_result) in enumerate(zip(audio_emotions, video_results)):
+                        start_time = i * segment_duration
+                        end_time = (i + 1) * segment_duration
+                        self.results_text.insert(tk.END, f"[{time.strftime('%M:%S', time.gmtime(start_time))} - {time.strftime('%M:%S', time.gmtime(end_time))}]: аудио - {audio_emotion}, видео - {video_result['dominant_emotion']}\n")
 
-                # Отображение распределения предсказаний
-                self.results_text.insert(tk.END, "\nСредние вероятности:\n")
-                for i, prob in enumerate(avg_probabilities):
-                    emotion_name = self.label_encoder.inverse_transform([i])[0]
-                    self.results_text.insert(tk.END, f"{emotion_name}: {prob:.2%}\n")
+                    self.root.after(0, self.create_plot, audio_emotions, video_results)
 
-                # Создание графика
-                self.create_plot(avg_probabilities.numpy(), self.label_encoder.classes_)
+                elif file_path.endswith('.wav'):
+                    audio_emotions = self.analyze_audio(file_path, segment_duration=2.0)
 
-        except Exception as e:
-            messagebox.showerror("Ошибка", f"Произошла ошибка при анализе: {str(e)}")
+                    self.results_text.delete(1.0, tk.END)
+                    self.results_text.insert(tk.END, f"Файл: {os.path.basename(file_path)}\n")
 
-    def create_plot(self, probabilities, emotions):
-        # Очистка предыдущего графика
+                    for i, emotion in enumerate(audio_emotions):
+                        start_time = i * 2
+                        end_time = (i + 1) * 2
+                        self.results_text.insert(tk.END, f"[{time.strftime('%M:%S', time.gmtime(start_time))} - {time.strftime('%M:%S', time.gmtime(end_time))}]: аудио - {emotion}\n")
+
+                    self.root.after(0, self.create_plot, audio_emotions)
+
+            except Exception as e:
+                messagebox.showerror("Ошибка", f"Произошла ошибка при анализе: {str(e)}")
+
+        threading.Thread(target=analyze).start()
+
+    def create_plot(self, audio_emotions, video_results=None):
         for widget in self.plot_frame.winfo_children():
             widget.destroy()
 
-        # Создание нового графика
-        plt.figure(figsize=(8, 4))
-        plt.bar(emotions, probabilities)
-        plt.title("Распределение вероятностей эмоций")
-        plt.xticks(rotation=45)
+        fig, axs = plt.subplots(1, 2, figsize=(12, 6))
+
+        # График для аудио
+        axs[0].bar(range(len(audio_emotions)), audio_emotions)
+        axs[0].set_title("Распределение эмоций по сегментам (аудио)")
+        axs[0].set_xticks(range(len(audio_emotions)))
+        axs[0].set_xticklabels([f"{i*2}-{(i+1)*2}s" for i in range(len(audio_emotions))], rotation=45)
+
+        # График для видео
+        if video_results:
+            video_emotions = [result['dominant_emotion'] for result in video_results]
+            axs[1].bar(range(len(video_emotions)), video_emotions)
+            axs[1].set_title("Распределение эмоций по сегментам (видео)")
+            axs[1].set_xticks(range(len(video_emotions)))
+            axs[1].set_xticklabels([f"{i*2}-{(i+1)*2}s" for i in range(len(video_emotions))], rotation=45)
+
         plt.tight_layout()
 
-        # Сохранение графика в буфер
         buf = BytesIO()
         plt.savefig(buf, format='png')
         buf.seek(0)
         plt.close()
 
-        # Отображение графика в интерфейсе
         image = Image.open(buf)
         photo = ImageTk.PhotoImage(image)
         label = ttk.Label(self.plot_frame, image=photo)
