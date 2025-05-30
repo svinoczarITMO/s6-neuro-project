@@ -1,5 +1,6 @@
 import pandas as pd
 import numpy as np
+from sklearn.metrics import f1_score
 import torch
 import torchaudio
 import torchaudio.transforms as T
@@ -167,11 +168,20 @@ class AudioEmotionDataset(Dataset):
             # Return a zero tensor as fallback
             return torch.zeros((1, 128, 128)), emotion
 
+def calculate_f1_scores(y_true, y_pred, average_methods=['macro', 'weighted']):
+    """Calculate F1 scores for different averaging methods"""
+    results = {}
+    for method in average_methods:
+        results[f'f1_{method}'] = f1_score(y_true, y_pred, average=method)
+    return results
+
 def train_epoch(model, train_loader, criterion, optimizer, device):
     model.train()
     total_loss = 0
     correct = 0
     total = 0
+    all_preds = []
+    all_targets = []
     
     for batch_idx, (data, target) in enumerate(tqdm(train_loader)):
         data, target = data.to(device), target.to(device)
@@ -191,13 +201,27 @@ def train_epoch(model, train_loader, criterion, optimizer, device):
         correct += pred.eq(target).sum().item()
         total += target.size(0)
         
-    return total_loss / len(train_loader), 100. * correct / total
+        # Store predictions and targets for F1 calculation
+        all_preds.extend(pred.cpu().numpy())
+        all_targets.extend(target.cpu().numpy())
+        
+    # Calculate F1 scores
+    f1_scores = calculate_f1_scores(all_targets, all_preds)
+    
+    return {
+        'loss': total_loss / len(train_loader),
+        'accuracy': 100. * correct / total,
+        'f1_macro': f1_scores['f1_macro'],
+        'f1_weighted': f1_scores['f1_weighted']
+    }
 
 def evaluate(model, test_loader, criterion, device):
     model.eval()
     total_loss = 0
     correct = 0
     total = 0
+    all_preds = []
+    all_targets = []
     
     with torch.no_grad():
         for data, target in test_loader:
@@ -209,8 +233,20 @@ def evaluate(model, test_loader, criterion, device):
             pred = output.argmax(dim=1)
             correct += pred.eq(target).sum().item()
             total += target.size(0)
+            
+            # Store predictions and targets for F1 calculation
+            all_preds.extend(pred.cpu().numpy())
+            all_targets.extend(target.cpu().numpy())
     
-    return total_loss / len(test_loader), 100. * correct / total
+    # Calculate F1 scores
+    f1_scores = calculate_f1_scores(all_targets, all_preds)
+    
+    return {
+        'loss': total_loss / len(test_loader),
+        'accuracy': 100. * correct / total,
+        'f1_macro': f1_scores['f1_macro'],
+        'f1_weighted': f1_scores['f1_weighted']
+    }
 
 def download_and_save_audio_files(df, output_dir="dataset"):
     """Download and save audio files from the dataset"""
@@ -292,7 +328,7 @@ def load_and_prepare_dataset():
             train_df['emotion_encoded'] = label_encoder.fit_transform(train_df['emotion'])
             test_df['emotion_encoded'] = label_encoder.transform(test_df['emotion'])
             pbar.update(30)
-            
+            ß
             # Download and save audio files
             download_and_save_audio_files(pd.concat([train_df, test_df]))
     
@@ -359,20 +395,38 @@ def main(train_new_model=False):
     patience = 10
     no_improve = 0
     
+    metrics_history = []
+    
     for epoch in range(num_epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
-        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+        train_metrics = train_epoch(model, train_loader, criterion, optimizer, device)
+        test_metrics = evaluate(model, test_loader, criterion, device)
+        
+        # Сохраняем метрики для истории
+        epoch_metrics = {
+            'epoch': epoch+1,
+            'train_loss': train_metrics['loss'],
+            'train_accuracy': train_metrics['accuracy'],
+            'train_f1_macro': train_metrics['f1_macro'],
+            'train_f1_weighted': train_metrics['f1_weighted'],
+            'test_loss': test_metrics['loss'],
+            'test_accuracy': test_metrics['accuracy'],
+            'test_f1_macro': test_metrics['f1_macro'],
+            'test_f1_weighted': test_metrics['f1_weighted']
+        }
+        metrics_history.append(epoch_metrics)
         
         # Update learning rate
-        scheduler.step(test_acc)
+        scheduler.step(test_metrics['accuracy'])
         
-        print(f'Epoch {epoch+1}/{num_epochs}:')
-        print(f'Train Loss: {train_loss:.4f}, Train Accuracy: {train_acc:.2f}%')
-        print(f'Test Loss: {test_loss:.4f}, Test Accuracy: {test_acc:.2f}%')
+        print(f'\nEpoch {epoch+1}/{num_epochs}:')
+        print(f'Train Loss: {train_metrics["loss"]:.4f} | Train Accuracy: {train_metrics["accuracy"]:.2f}%')
+        print(f'Train F1 Macro: {train_metrics["f1_macro"]:.4f} | Train F1 Weighted: {train_metrics["f1_weighted"]:.4f}')
+        print(f'Test Loss: {test_metrics["loss"]:.4f} | Test Accuracy: {test_metrics["accuracy"]:.2f}%')
+        print(f'Test F1 Macro: {test_metrics["f1_macro"]:.4f} | Test F1 Weighted: {test_metrics["f1_weighted"]:.4f}')
         
         # Early stopping
-        if test_acc > best_acc:
-            best_acc = test_acc
+        if test_metrics['accuracy'] > best_acc:
+            best_acc = test_metrics['accuracy']
             no_improve = 0
             torch.save(model.state_dict(), 'models/best_emotion_recognition_model.pth')
             print(f'New best model saved with accuracy: {best_acc:.2f}%')
